@@ -80,12 +80,24 @@ pipeline {
   set -e
   cd ${REMOTE_DIR}
 
-  # DOCKER LOGIN (variables expanded by Jenkins before sending)
+  # debug output
+  echo "DEBUG: IMAGE='${IMAGE}'"
+  echo "DEBUG: BUILD_NUMBER='${BUILD_NUMBER}'"
+  echo "DEBUG: DH_USER='${DH_USER}'"
+
+  # fallback tag if BUILD_NUMBER empty
+  TAG="${BUILD_NUMBER:-manual-${BUILD_ID}}"
+  echo "Using TAG=\$TAG"
+
+  # docker login
   echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
 
-  docker build -t ${IMAGE}:${BUILD_NUMBER} .
-  docker push ${IMAGE}:${BUILD_NUMBER}
-  docker tag ${IMAGE}:${BUILD_NUMBER} ${IMAGE}:latest || true
+  # build & push with safe tag
+  docker build -t ${IMAGE}:\$TAG .
+  docker push ${IMAGE}:\$TAG
+
+  # update latest tag
+  docker tag ${IMAGE}:\$TAG ${IMAGE}:latest || true
   docker push ${IMAGE}:latest || true
 EOF
           '''

@@ -76,15 +76,18 @@ pipeline {
             mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
 
-            ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<'EOF'
-              set -e
-              cd ${REMOTE_DIR}
-              echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-              docker build -t ${IMAGE}:${BUILD_NUMBER} .
-              docker push ${IMAGE}:${BUILD_NUMBER}
-              docker tag ${IMAGE}:${BUILD_NUMBER} ${IMAGE}:latest || true
-              docker push ${IMAGE}:latest || true
-            EOF
+            ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<EOF
+  set -e
+  cd ${REMOTE_DIR}
+
+  # DOCKER LOGIN (variables expanded by Jenkins before sending)
+  echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
+
+  docker build -t ${IMAGE}:${BUILD_NUMBER} .
+  docker push ${IMAGE}:${BUILD_NUMBER}
+  docker tag ${IMAGE}:${BUILD_NUMBER} ${IMAGE}:latest || true
+  docker push ${IMAGE}:latest || true
+EOF
           '''
         }
       }

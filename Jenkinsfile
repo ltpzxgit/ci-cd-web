@@ -1,34 +1,64 @@
-// Jenkinsfile - no ssh-agent plugin (uses sshUserPrivateKey + dockerhub creds)
 pipeline {
   agent any
   environment {
-    REMOTE = "deploy@54.169.161.25"            // user@host ของ remote
-    IMAGE  = "lattapon2540/ci-cd-web"          // dockerhub repo
-    SSH_CRED = "ssh-deploy-key"                // Jenkins SSH credential id (SSH Username with private key)
-    DOCKERHUB_CRED = "dockerhub-creds"         // Jenkins DockerHub credential id
+    REMOTE = "deploy@54.169.161.25"
+    IMAGE  = "lattapon2540/ci-cd-web"
+    SSH_CRED = "ssh-deploy-key"
+    DOCKERHUB_CRED = "dockerhub-creds"
     REMOTE_DIR = "/home/deploy/app"
   }
 
   stages {
-    stage('Checkout from GitHub') {
+    stage('Checkout') { steps { checkout scm } }
+
+    // DEBUG: sanitize + derive pubkey (run ONCE, then remove)
+    stage('PrintPubKey - DEBUG (remove after use)') {
       steps {
-        checkout scm
+        withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY')]) {
+          sh '''
+            set -e
+            echo "=== Sanitize key and show some diagnostics ==="
+            # remove CR (\r) if any
+            tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
+            mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
+            chmod 600 "${SSH_KEY}" || true
+
+            echo "SSH client version:"
+            ssh -V || true
+
+            echo "File type and size:"
+            file -b "${SSH_KEY}" || true
+            stat -c "%n %s bytes" "${SSH_KEY}" || true
+
+            # derive public key
+            if ssh-keygen -y -f "${SSH_KEY}" > /tmp/jenkins_pubkey.pub 2>/tmp/sshkey.err; then
+              echo "---- BEGIN JENKINS DERIVED PUBLIC KEY ----"
+              cat /tmp/jenkins_pubkey.pub
+              echo "---- END JENKINS DERIVED PUBLIC KEY ----"
+            else
+              echo "ssh-keygen failed, show error:"
+              cat /tmp/sshkey.err || true
+              exit 1
+            fi
+          '''
+        }
       }
     }
 
     stage('Prep remote dir & sync') {
       steps {
-        // get path to key on agent (or temp file provided by Jenkins)
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
           sh '''
             set -e
+            # sanitize key again just in case
+            tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
+            mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
 
-            # Ensure remote dir and clean it
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} "mkdir -p ${REMOTE_DIR} && rm -rf ${REMOTE_DIR}/*"
 
-            # rsync source to remote (exclude .git, node_modules)
-            rsync -avz -e "ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no" --delete --exclude='.git' --exclude='node_modules' . ${REMOTE}:${REMOTE_DIR}
+            RSYNC_SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+            rsync -avz -e "$RSYNC_SSH" --delete --exclude='.git' --exclude='node_modules' . ${REMOTE}:${REMOTE_DIR}
           '''
         }
       }
@@ -42,21 +72,16 @@ pipeline {
         ]) {
           sh '''
             set -e
+            tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
+            mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
 
-            # run build & push on remote host
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<'EOF'
               set -e
               cd ${REMOTE_DIR}
-
-              # Docker login using creds from Jenkins
               echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-
-              # Build and push tagged image
               docker build -t ${IMAGE}:${BUILD_NUMBER} .
               docker push ${IMAGE}:${BUILD_NUMBER}
-
-              # update latest tag (optional)
               docker tag ${IMAGE}:${BUILD_NUMBER} ${IMAGE}:latest || true
               docker push ${IMAGE}:latest || true
             EOF
@@ -70,7 +95,6 @@ pipeline {
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY')]) {
           sh '''
             chmod 600 "${SSH_KEY}" || true
-
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<'EOF'
               set -e
               docker rm -f ci-cd-web || true
@@ -92,11 +116,7 @@ pipeline {
   }
 
   post {
-    success {
-      echo "Pipeline ${env.BUILD_NUMBER} succeeded!"
-    }
-    failure {
-      echo "Pipeline ${env.BUILD_NUMBER} failed — check console output."
-    }
+    success { echo "Pipeline ${env.BUILD_NUMBER} succeeded!" }
+    failure { echo "Pipeline ${env.BUILD_NUMBER} failed — check console output." }
   }
 }

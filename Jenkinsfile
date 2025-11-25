@@ -6,19 +6,28 @@ pipeline {
     SSH_CRED = "ssh-deploy-key"
     DOCKERHUB_CRED = "dockerhub-creds"
     REMOTE_DIR = "/home/deploy/app"
+    // note: BUILD_NUMBER is runtime; we'll compute TAG in a stage and persist it to workspace
+  }
+
+  options {
+    timestamps()
+    timeout(time: 60, unit: 'MINUTES')
   }
 
   stages {
-    stage('Checkout') { steps { checkout scm } }
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
 
-    // DEBUG: sanitize + derive pubkey (run ONCE, then remove)
+    // DEBUG: derive pubkey (run ONCE then REMOVE)
     stage('PrintPubKey - DEBUG (remove after use)') {
       steps {
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY')]) {
           sh '''
             set -e
             echo "=== Sanitize key and show some diagnostics ==="
-            # remove CR (\r) if any
             tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
             mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
@@ -30,7 +39,6 @@ pipeline {
             file -b "${SSH_KEY}" || true
             stat -c "%n %s bytes" "${SSH_KEY}" || true
 
-            # derive public key
             if ssh-keygen -y -f "${SSH_KEY}" > /tmp/jenkins_pubkey.pub 2>/tmp/sshkey.err; then
               echo "---- BEGIN JENKINS DERIVED PUBLIC KEY ----"
               cat /tmp/jenkins_pubkey.pub
@@ -50,7 +58,6 @@ pipeline {
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
           sh '''
             set -e
-            # sanitize key again just in case
             tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
             mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
@@ -72,33 +79,34 @@ pipeline {
         ]) {
           sh '''
             set -e
+            # sanitize key
             tr -d '\\r' < "${SSH_KEY}" > "${SSH_KEY}.clean" || true
             mv "${SSH_KEY}.clean" "${SSH_KEY}" || true
             chmod 600 "${SSH_KEY}" || true
 
+            # compute TAG on Jenkins side (fallback to manual-BUILD_ID if BUILD_NUMBER empty)
+            TAG="${BUILD_NUMBER}"
+            if [ -z "$TAG" ]; then
+              TAG="manual-${BUILD_ID}"
+            fi
+            echo "JENKINS: computed TAG=$TAG"
+            # persist tag so Deploy stage can use the exact same value
+            echo "$TAG" > ${WORKSPACE}/.deploy_tag
+
+            # send commands to remote (Jenkins expands ${TAG}, ${IMAGE}, ${REMOTE_DIR} before sending)
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<EOF
-  set -e
-  cd ${REMOTE_DIR}
+set -e
+cd ${REMOTE_DIR}
 
-  # debug output
-  echo "DEBUG: IMAGE='${IMAGE}'"
-  echo "DEBUG: BUILD_NUMBER='${BUILD_NUMBER}'"
-  echo "DEBUG: DH_USER='${DH_USER}'"
+echo "REMOTE: Using TAG=${TAG}"
+echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
 
-  # fallback tag if BUILD_NUMBER empty
-  TAG="${BUILD_NUMBER:-manual-${BUILD_ID}}"
-  echo "Using TAG=\$TAG"
+docker build -t ${IMAGE}:${TAG} .
+docker push ${IMAGE}:${TAG}
 
-  # docker login
-  echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
-
-  # build & push with safe tag
-  docker build -t ${IMAGE}:\$TAG .
-  docker push ${IMAGE}:\$TAG
-
-  # update latest tag
-  docker tag ${IMAGE}:\$TAG ${IMAGE}:latest || true
-  docker push ${IMAGE}:latest || true
+# update latest tag
+docker tag ${IMAGE}:${TAG} ${IMAGE}:latest || true
+docker push ${IMAGE}:latest || true
 EOF
           '''
         }
@@ -109,13 +117,22 @@ EOF
       steps {
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY')]) {
           sh '''
+            set -e
+            # read TAG computed earlier
+            if [ -f ${WORKSPACE}/.deploy_tag ]; then
+              TAG="$(cat ${WORKSPACE}/.deploy_tag)"
+            else
+              TAG="${BUILD_NUMBER}"
+            fi
+            echo "Deploying TAG=$TAG"
+
             chmod 600 "${SSH_KEY}" || true
-            ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<'EOF'
-              set -e
-              docker rm -f ci-cd-web || true
-              docker pull ${IMAGE}:${BUILD_NUMBER}
-              docker run -d --name ci-cd-web -p 3000:3000 ${IMAGE}:${BUILD_NUMBER}
-            EOF
+            ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} <<EOF
+set -e
+docker rm -f ci-cd-web || true
+docker pull ${IMAGE}:${TAG}
+docker run -d --name ci-cd-web -p 3000:3000 --restart unless-stopped ${IMAGE}:${TAG}
+EOF
           '''
         }
       }
@@ -124,7 +141,16 @@ EOF
     stage('Healthcheck') {
       steps {
         withCredentials([sshUserPrivateKey(credentialsId: SSH_CRED, keyFileVariable: 'SSH_KEY')]) {
-          sh 'ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} "docker ps --filter name=ci-cd-web --format \\"{{.Names}} {{.Image}} {{.Status}}\\""'
+          sh '''
+            TAG=""
+            if [ -f ${WORKSPACE}/.deploy_tag ]; then
+              TAG="$(cat ${WORKSPACE}/.deploy_tag)"
+            else
+              TAG="${BUILD_NUMBER}"
+            fi
+            ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no ${REMOTE} "docker ps --filter name=ci-cd-web --format '{{.Names}} {{.Image}} {{.Status}}' | grep ci-cd-web || true"
+            echo "Healthcheck done for ${IMAGE}:${TAG}"
+          '''
         }
       }
     }
